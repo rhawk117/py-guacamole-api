@@ -27,28 +27,51 @@ class HttpError(GuacError):
         self.response: httpx.Response | None = response
         super().__init__(f"HTTP {status}, {detail}" + (f" (code={code})" if code else ""))
 
-class AuthError(HttpError): ...
+class AuthError(HttpError):
+    """
+    For 401 Unauthorized responses.
+    """
 
 
-class PermissionError(HttpError): ...
+class PermissionError(HttpError):
+    """
+    For 403 Forbidden responses.
+    """
+
+class NotFoundError(HttpError):
+    """
+    For 404 Not Found responses.
+    """
 
 
-class NotFoundError(HttpError): ...
+class RateLimitError(HttpError):
+    """
+    For 408 Request Timeout and 429 Too Many Requests responses.
+    """
 
 
-class RateLimitError(HttpError): ...
+class ServerError(HttpError):
+    """
+    For 5xx Server Error responses.
+    """
 
 
-class ServerError(HttpError): ...
+class DecodeError(HttpError):
+    """
+    For errors decoding response data.
+    """
 
 
-class DecodeError(HttpError): ...
+class TransportError(HttpError):
+    """
+    For errors in the transport layer.
+    """
 
 
-class TransportError(HttpError): ...
-
-
-class TokenRefreshError(HttpError): ...
+class TokenRefreshError(HttpError):
+    """
+    For errors refreshing authentication tokens.
+    """
 
 
 def get_error_by_status(status: int) -> type[HttpError]:
