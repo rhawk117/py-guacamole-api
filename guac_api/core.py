@@ -30,6 +30,7 @@ class RequestSpec:
     headers: dict[str, str] | None = None
 
 
+
 def build_url(host: str, path_prefix: str | None, path: str) -> str:
     '''
     Construct a full URL from the host, optional path prefix,
