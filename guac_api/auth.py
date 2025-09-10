@@ -1,14 +1,16 @@
-
+import abc
 import asyncio
 from datetime import timedelta
 import threading
 import time
-from typing import Generic, NamedTuple, Self, TypeVar, TypedDict
+from typing import TYPE_CHECKING, Generic, NamedTuple, Self, TypeVar, TypedDict
 
 import httpx
 import dataclasses as dc
-from guac_api.options import GuacamoleConfig
 from guac_api.errors import AuthError
+
+if TYPE_CHECKING:
+    from .options import ClientConfig
 
 class GuacToken(NamedTuple):
     token: str
@@ -25,36 +27,23 @@ class _Credentials(TypedDict):
 
 @dc.dataclass
 class _AuthClient(Generic[C]):
-    '''
+    """
     A base class for both the synchronous and asynchronous
     Guacamole authentication clients.
-    '''
-    _client: C
-    _credentials: _Credentials
-    _url: str
+    """
 
-    @classmethod
-    def from_config(cls, config: GuacamoleConfig, client: C) -> Self:
-        '''
-        Factory method to create an AuthClient from a GuacamoleConfig.
+    client: C
+    _url: str = dc.field(init=False, default="/tokens")
 
-        Parameters
-        ----------
-        config : GuacamoleConfig
-        client : C
-
-        Returns
-        -------
-        Self
-        '''
-        return cls(
-            _client=client,
-            _credentials={"username": config.username, "password": config.password},
-            _url=f"{config.url}/api/tokens",
+    def create_token_request(self, credentials: _Credentials) -> httpx.Request:
+        return self.client.build_request(
+            method="POST",
+            url=self._url,
+            data=credentials,
         )
 
-    def _check_token_response(self, token_response: httpx.Response) -> str:
-        '''
+    def _extract_token(self, token_response: httpx.Response) -> GuacToken:
+        """
         Validates a token response from the Guacamole server.
 
         Parameters
@@ -69,7 +58,7 @@ class _AuthClient(Generic[C]):
         ------
         AuthError
             _The `authToken` is missing or the response status is not 2xx._
-        '''
+        """
         try:
             token_response.raise_for_status()
         except httpx.HTTPStatusError as e:
@@ -86,45 +75,22 @@ class _AuthClient(Generic[C]):
                 detail="Authentication response missing authToken",
                 response=token_response,
             )
-        return token
-
-
-class AsyncAuthClient(_AuthClient[httpx.AsyncClient]):
-    '''
-    An asynchronous implementation of the Guacamole authentication client.
-    '''
-    async def aclose(self) -> None:
-        await self._client.aclose()
-
-    async def get_token(self, *, credentials: _Credentials | None = None) -> GuacToken:
-        '''
-        Requests a new authentication token from the Guacamole server.
-
-        Parameters
-        ----------
-        credentials : _Credentials | None, optional
-            The credentials to use other than the default ones
-            that were provided at initialization time, by default None
-
-        Returns
-        -------
-        GuacToken
-        '''
-        credentials = credentials or self._credentials
-        resp = await self._client.post(self._url, data=credentials)
-        token = self._check_token_response(resp)
         return GuacToken(token=token, created_at=time.time())
 
-    async def delete_token(self, token: str) -> None:
+    def delete_token_request(self, token: str) -> httpx.Request:
         url = f"{self._url}/{token}"
-        await self._client.delete(url)
+        return self.client.build_request(
+            method="DELETE",
+            url=url,
+        )
 
 
-class SyncAuthClient(_AuthClient[httpx.Client]):
-    def close(self) -> None:
-        self._client.close()
+class AsyncTokensClient(_AuthClient[httpx.AsyncClient]):
+    """
+    An asynchronous implementation of the Guacamole authentication client.
+    """
 
-    def get_token(self, *, credentials: _Credentials | None = None) -> GuacToken:
+    async def get_token(self, credentials: _Credentials) -> GuacToken:
         """
         Requests a new authentication token from the Guacamole server.
 
@@ -138,200 +104,220 @@ class SyncAuthClient(_AuthClient[httpx.Client]):
         -------
         GuacToken
         """
-        credentials = credentials or self._credentials
-        resp = self._client.post(self._url, data=credentials)
-        token = self._check_token_response(resp)
-        return GuacToken(token=token, created_at=time.time())
+
+        request = self.create_token_request(credentials)
+        resp = await self.client.send(request)
+        return self._extract_token(resp)
+
+    async def delete_token(self, token: str | None = None) -> None:
+        url = f"{self._url}/{token}"
+        await self.client.delete(url)
+
+
+class TokensClient(_AuthClient[httpx.Client]):
+    def get_token(self, credentials: _Credentials) -> GuacToken:
+        """
+        Requests a new authentication token from the Guacamole server.
+
+        Parameters
+        ----------
+        credentials : _Credentials | None, optional
+            The credentials to use other than the default ones
+            that were provided at initialization time, by default None
+
+        Returns
+        -------
+        GuacToken
+        """
+        request = self.create_token_request(credentials)
+        resp = self.client.send(request)
+        return self._extract_token(resp)
 
     def delete_token(self, token: str) -> None:
-        '''
+        """
         Deletes/invalidates a token on the Guacamole server.
 
         Parameters
         ----------
         token : str
             _The token string to delete._
-        '''
+        """
         url = f"{self._url}/{token}"
-        self._client.delete(url)
+        self.client.delete(url)
+
+
 
 
 def has_token_expired(token: GuacToken | None, idle_timeout: float) -> bool:
+    """
+    Checks if a token has expired based on its creation time and the idle timeout.
+
+    Parameters
+    ----------
+    token : GuacToken
+        The token to check.
+    idle_timeout : float
+        The idle timeout in seconds.
+
+    Returns
+    -------
+    bool
+        True if the token has expired, False otherwise.
+    """
     if not token:
         return True
+
     elapsed = time.time() - token.created_at
     return elapsed >= idle_timeout
 
 
-@dc.dataclass
-class _TokenProvider:
-    _idle_timeout: float
-    _token: GuacToken | None
-
-    @property
-    def expired(self) -> bool:
-        return has_token_expired(self._token, self._idle_timeout)
-
-
-@dc.dataclass
-class SyncTokenProvider(_TokenProvider):
-    '''
-    A thread-safe synchronous token provider that refreshes tokens on demand
-    by keeping track of the token's creation time and an idle timeout.
-    '''
-    _client: SyncAuthClient
-    _lock: threading.Lock
-
-    @classmethod
-    def from_config(cls, config: GuacamoleConfig, client: httpx.Client) -> Self:
-        auth_client = SyncAuthClient.from_config(config, client)
-        idle_timeout = config.idle_timeout or timedelta(minutes=5)
-        return cls(
-            _client=auth_client,
-            _lock=threading.Lock(),
-            _idle_timeout=idle_timeout.total_seconds(),
-            _token=None,
-        )
-
-    def get_token(self) -> str:
-        '''
-        Gets a valid token, refreshing it if necessary.
-        Is thread-safe.
-
-        Returns
-        -------
-        str
-            _The session token_
-
-        Raises
-        ------
-        AuthError
-            _If unable to obtain a valid token._
-        '''
-        with self._lock:
-            if not self._token or self.expired:
-                self._token = self._client.get_token()
-        return self._token.token
-
-    def close(self) -> None:
-        self._client.close()
-
-
-@dc.dataclass
-class AsyncTokenProvider(_TokenProvider):
-    _client: AsyncAuthClient
-    _lock: asyncio.Lock
-
-    @classmethod
-    def from_config(cls, config: GuacamoleConfig, client: httpx.AsyncClient) -> Self:
-        auth_client = AsyncAuthClient.from_config(config, client)
-        idle_timeout = config.idle_timeout or timedelta(minutes=5)
-        return cls(
-            _client=auth_client,
-            _lock=asyncio.Lock(),
-            _idle_timeout=idle_timeout.total_seconds(),
-            _token=None,
-        )
-
-    async def get_token(self) -> str:
-        '''
-        Gets a valid token, refreshing it if necessary.
-        Is thread-safe.
-
-        Returns
-        -------
-        str
-            _The session token_
-
-        Raises
-        ------
-        AuthError
-            _If unable to obtain a valid token._
-        '''
-        async with self._lock:
-            if not self._token or self.expired:
-                self._token = await self._client.get_token()
-        return self._token.token
-
-    async def aclose(self) -> None:
-        await self._client.aclose()
-
-
-
-
 class GuacamoleSession(httpx.Auth):
-    '''
-    An httpx.Auth implementation that handles Guacamole token-based authentication,
-    and automatically refreshes tokens as needed when they expire as long as the
-    credentials don't become stale.
-
-    It supports both synchronous and asynchronous token providers, but only one
-    should be provided at initialization time. If you call the associated public
-    getter for the provider that wasn't configured, a ValueError will be raised.
-    '''
     requires_response_body = True
 
     def __init__(
         self,
+        crendetials: _Credentials,
+        tokens_client: TokensClient,
         *,
-        sync_backend: SyncTokenProvider | None = None,
-        async_backend: AsyncTokenProvider | None = None,
+        idle_timeout: timedelta | None = None,
     ) -> None:
-        if not sync_backend and not async_backend:
-            raise ValueError("Either token_provider or async_backend must be provided")
-
-        self._sync_backend = sync_backend
-        self._async_backend = async_backend
-
-    @property
-    def async_provider(self) -> AsyncTokenProvider:
-        if not self._async_backend:
-            raise ValueError("No async token provider configured")
-        return self._async_backend
-
-    @property
-    def sync_provider(self) -> SyncTokenProvider:
-        if not self._sync_backend:
-            raise ValueError("No sync token provider configured")
-        return self._sync_backend
+        idle_timeout = idle_timeout or timedelta(minutes=5)
+        self._idle_timeout: float = idle_timeout.total_seconds()
+        self._credentials = crendetials
+        self.token: GuacToken | None = None
+        self._lock: threading.Lock = threading.Lock()
+        self._tokens_client: TokensClient = tokens_client
 
     def set_token_param(self, request: httpx.Request, token: str) -> None:
         request.url = request.url.copy_add_param("token", token)
 
+    def _touch(self) -> None:
+        """
+        Updates the token's creation time to the current time,
+        effectively resetting the idle timeout.
+        """
+        if self.token:
+            self.token = GuacToken(
+                token=self.token.token,
+                created_at=time.time()
+            )
+
+    def get_token(self) -> str:
+        with self._lock:
+            if has_token_expired(self.token, self._idle_timeout):
+                self.token = self._tokens_client.get_token(self._credentials)
+            else:
+                self._touch()
+
+        return self.token.token # type: ignore[return-value]
+
     def auth_flow(self, request: httpx.Request):
-        token = self.sync_provider.get_token()
+        token = self.get_token()
         self.set_token_param(request, token)
         response = yield request
         if response.status_code == 401:
-            token = self.sync_provider.get_token()
+            token = self.get_token()
             self.set_token_param(request, token)
             yield request
 
-    async def async_auth_flow(self, request: httpx.Request):
-        token = await self.async_provider.get_token()
+    @classmethod
+    def from_credentials(
+        cls,
+        guac_host: str,
+        *,
+        credentials: _Credentials,
+        client_config: ClientConfig | None = None,
+        idle_timeout: timedelta | None = None,
+    ) -> Self:
+        client_config = client_config or ClientConfig()
+        client_kwargs = dc.asdict(client_config)
+        client_kwargs['base_url'] = guac_host.rstrip('/')
+
+        tokens_client = TokensClient(
+            client=httpx.Client(**client_kwargs)
+        )
+        return cls(
+            crendetials=credentials,
+            tokens_client=tokens_client,
+            idle_timeout=idle_timeout,
+        )
+
+    def dispose(self) -> None:
+        self._tokens_client.client.close()
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *args) -> None:
+        self.dispose()
+
+class AsyncGuacamoleSession(httpx.Auth):
+    requires_response_body = True
+
+    def __init__(
+        self,
+        credentials: _Credentials,
+        tokens_client: AsyncTokensClient,
+        *,
+        idle_timeout: timedelta | None = None,
+    ) -> None:
+        idle_timeout = idle_timeout or timedelta(minutes=5)
+        self._idle_timeout: float = idle_timeout.total_seconds()
+        self._credentials = credentials
+        self.token: GuacToken | None = None
+        self._lock: asyncio.Lock = asyncio.Lock()
+        self._tokens_client: AsyncTokensClient = tokens_client
+
+    def set_token_param(self, request: httpx.Request, token: str) -> None:
+        request.url = request.url.copy_add_param("token", token)
+
+    async def _touch(self) -> None:
+        """
+        Updates the token's creation time to the current time,
+        effectively resetting the idle timeout.
+        """
+        if self.token:
+            self.token = GuacToken(
+                token=self.token.token,
+                created_at=time.time()
+            )
+
+    async def get_token(self) -> str:
+        async with self._lock:
+            if has_token_expired(self.token, self._idle_timeout):
+                self.token = await self._tokens_client.get_token(self._credentials)
+            else:
+                await self._touch()
+
+        return self.token.token # type: ignore[return-value]
+
+    async def auth_flow(self, request: httpx.Request):
+        token = await self.get_token()
         self.set_token_param(request, token)
         response = yield request
         if response.status_code == 401:
-            token = await self.async_provider.get_token()
+            token = await self.get_token()
             self.set_token_param(request, token)
             yield request
 
-    def get_provider(self) -> SyncTokenProvider | AsyncTokenProvider:
-        '''
-        Gets the configured token provider, either synchronous or asynchronous.
+    @classmethod
+    def from_credentials(
+        cls,
+        guac_host: str,
+        *,
+        credentials: _Credentials,
+        client_config: ClientConfig | None = None,
+        idle_timeout: timedelta | None = None,
+    ) -> Self:
+        client_config = client_config or ClientConfig()
+        client_kwargs = dc.asdict(client_config)
+        client_kwargs['base_url'] = guac_host.rstrip('/')
 
-        Returns
-        -------
-        SyncTokenProvider | AsyncTokenProvider
-
-        Raises
-        ------
-        ValueError
-        '''
-        if self._sync_backend:
-            return self._sync_backend
-
-        if self._async_backend:
-            return self._async_backend
-
-        raise ValueError("how did we get here?")
+        tokens_client = AsyncTokensClient(
+            client=httpx.AsyncClient(**client_kwargs)
+        )
+        return cls(
+            credentials=credentials,
+            tokens_client=tokens_client,
+            idle_timeout=idle_timeout,
+        )

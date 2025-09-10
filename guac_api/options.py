@@ -50,9 +50,10 @@ class ClientConfig:
     max_redirects: int = 20
     mounts: Mapping[str, httpx.BaseTransport] | None = None
     transport: httpx.BaseTransport | None = None
-    request_hooks: Sequence[ResponseHookTypes] | None = None
-    response_hooks: Sequence[ResponseHookTypes] | None = None
-
+    hooks: Mapping[
+        str,
+        Sequence[RequestHookTypes | ResponseHookTypes],
+    ] | None = None
 
 @dc.dataclass(slots=True, kw_only=True)
 class GuacamoleConfig:
@@ -66,5 +67,5 @@ class GuacamoleConfig:
 
     @property
     def url(self) -> str:
-        return self.host.rstrip("/")
+        return f'{self.host.rstrip("/")}/api'
 
