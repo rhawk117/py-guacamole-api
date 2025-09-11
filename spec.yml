@@ -1,0 +1,29 @@
+base_url: '{host}/api'
+session_url: '{host}/api/session/data/{data_source}'
+tunnels_url: '{host}/api/tunnels'
+
+routes:
+  tokens:
+    base_path: /tokens
+    scheme:
+      - name: Create Token
+        method: POST
+        content_type: application/x-www-form-urlencoded
+        response_type: JSON
+        data:
+          - name: username
+            type: string
+            required: true
+
+          - name: password
+            type: string
+            required: true
+
+      - name: Delete token
+        method: DELETE
+
+  schema:
+    base_path: /scheme
+    scheme:
+      - name: Get Users
+        method: GET
