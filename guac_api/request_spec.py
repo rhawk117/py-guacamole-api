@@ -1,6 +1,5 @@
 
 
-
 import contextlib
 import dataclasses as dc
 from datetime import timedelta
@@ -10,12 +9,7 @@ from typing import Generic, Literal, Self, TypeVar, TypedDict, Unpack
 import urllib
 import urllib.parse
 import httpx
-
-
-
-
-
-
+from guac_api.errors import raise_for_response
 
 
 class SessionToken:
@@ -33,7 +27,6 @@ class SessionToken:
             return False
         return (time.time() - self._created_at) > self.idle_timeout
 
-
     def touch(self) -> None:
         self._created_at = time.time()
 
@@ -47,9 +40,6 @@ class SessionToken:
         self._created_at = time.time()
 
 
-
-
-
 HTTPMethods = Literal['GET', 'POST', 'PUT', 'DELETE', 'PATCH']
 
 
@@ -58,6 +48,7 @@ class ContentType(enum.Enum):
     FORM = 'application/x-www-form-urlencoded'
     MULTIPART = 'multipart/form-data'
     UNSET = ''
+
 
 def build_path(
     base_path: str,
@@ -83,19 +74,22 @@ def build_path(
         return base_path
 
     try:
-        escaped_params = {k: urllib.parse.quote(v, safe='') for k, v in path_params.items()}
+        escaped_params = {k: urllib.parse.quote(
+            v, safe='') for k, v in path_params.items()}
         return base_path.format(**escaped_params)
     except KeyError as e:
         raise ValueError(f"Missing path parameter: {e}") from e
 
 
-
 class RequestParams(TypedDict, total=False):
     path_params: dict[str, str]
-    body: dict
+    body: dict | list[dict]
     form: dict[str, str]
     query_params: dict[str, str]
+
+class RequestOptions(TypedDict, total=False):
     timeout: float
+    headers: dict[str, str]
 
 
 @dc.dataclass(slots=True)
@@ -104,11 +98,11 @@ class RequestSpec:
     path: str
     content_type: ContentType = ContentType.UNSET
 
-
     def create_request(
         self,
         client: httpx.Client | httpx.AsyncClient,
-        **params: Unpack[RequestParams]
+        router_path: str = '',
+        **params: Unpack[RequestParams],
     ) -> httpx.Request:
 
         body = params.get('body')
@@ -117,8 +111,12 @@ class RequestSpec:
         if self._method == 'GET' and bool(body or form):
             raise ValueError("GET requests cannot have a body or form data")
 
+        path = router_path + self.path
+        path = build_path(path, params.get('path_params'))
 
-        path = build_path(self.path, params.get('path_params'))
+        headers = {}
+        if self.content_type != ContentType.UNSET:
+            headers['Content-Type'] = self.content_type.value
 
         return client.build_request(
             url=path,
@@ -126,14 +124,13 @@ class RequestSpec:
             params=params.get('query_params'),
             json=body if self.content_type == ContentType.JSON else None,
             data=form if self.content_type == ContentType.FORM else None,
-            timeout=params.get('timeout'),
         )
 
     @classmethod
     def get(
         cls,
-        *,
         path: str,
+        *,
         content_type: ContentType = ContentType.UNSET,
     ) -> Self:
         return cls(
@@ -145,8 +142,8 @@ class RequestSpec:
     @classmethod
     def post(
         cls,
-        *,
         path: str,
+        *,
         content_type: ContentType = ContentType.JSON,
     ) -> Self:
         return cls(
@@ -158,8 +155,8 @@ class RequestSpec:
     @classmethod
     def put(
         cls,
-        *,
         path: str,
+        *,
         content_type: ContentType = ContentType.JSON,
     ) -> Self:
         return cls(
@@ -171,8 +168,8 @@ class RequestSpec:
     @classmethod
     def delete(
         cls,
-        *,
         path: str,
+        *,
         content_type: ContentType = ContentType.UNSET,
     ) -> Self:
         return cls(
@@ -184,8 +181,8 @@ class RequestSpec:
     @classmethod
     def patch(
         cls,
-        *,
         path: str,
+        *,
         content_type: ContentType = ContentType.JSON,
     ) -> Self:
         return cls(
@@ -195,13 +192,13 @@ class RequestSpec:
         )
 
 
-
-
-
 C = TypeVar('C', httpx.Client, httpx.AsyncClient)
 
-class HttpBackend(Generic[C]):
 
+class ApiRouter(Generic[C]):
+    '''
+    Base class for HTTP backends.
+    '''
 
     def __init__(
         self,
@@ -212,66 +209,52 @@ class HttpBackend(Generic[C]):
         self._client: C = client
         self.path: str = path
 
-    def build_request(
-        self,
-        spec: RequestSpec,
-        **params: Unpack[RequestParams]
-    ) -> httpx.Request:
-        return spec.create_request(self._client, **params)
+    def get_response_json(self, response: httpx.Response) -> dict:
+        raise_for_response(response)
+        if response.status_code == 204:
+            return {}
+        try:
+            return response.json()
+        except ValueError as e:
+            raise ValueError("Response content is not valid JSON") from e
 
-    def send_sync( self, request: httpx.Request) -> httpx.Response:
-        raise NotImplementedError
 
-    def stream(self, request: httpx.Request) -> httpx.Response:
-        raise NotImplementedError
-
-    async def send_async(self, request: httpx.Request) -> httpx.Response:
-        raise NotImplementedError
-
-    async def stream_async(self, request: httpx.Request) -> httpx.Response:
+    def request(self, spec: RequestSpec, **params: Unpack[RequestParams]) -> httpx.Response:
         raise NotImplementedError
 
 
-class SyncRequestBackend(HttpBackend[httpx.Client]):
-    def send_sync(self, request: httpx.Request) -> httpx.Response:
-        return self._client.send(request)
-
-    @contextlib.contextmanager
-    def stream(self, request: httpx.Request) :
-        with self._client.stream(
-            request.method,
-            request.url,
-            headers=request.headers,
-            params=request.url.params,
-            content=request.content,
-        ) as response:
-            yield response
-
-    def __call__(self, spec: RequestSpec, **params: Unpack[RequestParams]) -> httpx.Response:
-        request = self.build_request(spec, **params)
-        return self.send_sync(request)
-
-
-
-class AsyncRequestBackend(HttpBackend[httpx.AsyncClient]):
-    async def send_async(self, request: httpx.Request) -> httpx.Response:
-        return await self._client.send(request)
-
-    @contextlib.asynccontextmanager
-    async def stream_async(self, request: httpx.Request) :
-        async with self._client.stream(
-            request.method,
-            request.url,
-            headers=request.headers,
-            params=request.url.params,
-            content=request.content,
-        ) as response:
-            yield response
-
-    async def __call__(self, spec: RequestSpec, **params: Unpack[RequestParams]) -> httpx.Response:
-        request = self.build_request(spec, **params)
-        return await self.send_async(request)
+    async def async_request(self, spec: RequestSpec, **params: Unpack[RequestParams]) -> httpx.Response:
+        raise NotImplementedError
 
 
 
 
+
+class SyncApiRouter(ApiRouter[httpx.Client]):
+    def request(self, spec: RequestSpec, **params: Unpack[RequestParams]) -> dict:
+        request = spec.create_request(
+            self._client,
+            self.path,
+            **params
+        )
+        try:
+            response = self._client.send(request)
+        except httpx.HTTPError as e:
+            raise ConnectionError("HTTP request failed") from e
+        return self.get_response_json(response)
+
+
+
+
+class AsyncApiRouter(ApiRouter[httpx.AsyncClient]):
+    async def async_request(self, spec: RequestSpec, **params: Unpack[RequestParams]) -> dict:
+        request = spec.create_request(
+            self._client,
+            self.path,
+            **params
+        )
+        try:
+            response = await self._client.send(request)
+        except httpx.HTTPError as e:
+            raise ConnectionError("HTTP request failed") from e
+        return self.get_response_json(response)

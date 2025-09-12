@@ -1,24 +1,41 @@
 
-from .spec import RequestSpec, ResponseTypes
+import httpx
+from guac_api.request_spec import AsyncApiRouter, RequestSpec, SyncApiRouter
 
 
-path = '/history'
 
-get_users_history = RequestSpec(
-    method='GET',
-    path='/users',
-    response_type=ResponseTypes.JSON,
-)
+class HistoryEndpoint:
+    path = '/history'
 
-get_connections_history = RequestSpec(
-    method='GET',
-    path='/connections',
-    response_type=ResponseTypes.JSON,
-)
+    def get_users(self) -> RequestSpec:
+        return RequestSpec.get("/users")
 
-get_active_connections = RequestSpec(
-    method='GET',
-    path='/',
-    response_type=ResponseTypes.JSON,
-)
+    def get_connections(self) -> RequestSpec:
+        return RequestSpec.get("/connections")
 
+
+class SyncHistoryRouter(SyncApiRouter):
+    def __init__(self, client: httpx.Client) -> None:
+        super().__init__(client, path=HistoryEndpoint.path)
+        self.endpoint = HistoryEndpoint()
+
+    def get_users(self) -> dict:
+        spec = self.endpoint.get_users()
+        return self.request(spec)
+
+    def get_connections(self) -> dict:
+        spec = self.endpoint.get_connections()
+        return self.request(spec)
+
+class AsyncHistoryRouter(AsyncApiRouter):
+    def __init__(self, client: httpx.AsyncClient, session_path: str) -> None:
+        super().__init__(client, path=f"{session_path}/{HistoryEndpoint.path}")
+        self.endpoint = HistoryEndpoint()
+
+    async def get_users(self) -> dict:
+        spec = self.endpoint.get_users()
+        return await self.async_request(spec)
+
+    async def get_connections(self) -> dict:
+        spec = self.endpoint.get_connections()
+        return await self.async_request(spec)
